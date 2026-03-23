@@ -1,0 +1,13 @@
+# Core
+numpy
+scipy
+pandas
+torch
+tqdm
+
+# Datasets
+datasetsforecast          # M4 loader
+
+# Models
+chronos-forecasting       # pip install chronos-forecasting
+timesfm                   # pip install timesfm

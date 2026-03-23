@@ -1,0 +1,6 @@
+/data
+/outputs
+/plots
+/.vscode
+**/__pycache__/
+.python-version
