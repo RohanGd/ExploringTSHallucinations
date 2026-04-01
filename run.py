@@ -51,6 +51,7 @@ def build_datasets(args) -> dict:
             context_len      = CONTEXT_LEN,
             forecast_horizon = FORECAST_HORIZON,
             data_dir         = args.m4_data_dir,
+            filter           = args.m4_filter_file
         )
     return ds
 
@@ -64,6 +65,7 @@ def build_models(args) -> dict:
             size        = args.chronos_size,
             device      = device,
             num_samples = args.chronos_num_samples,
+            save_activations = str(args.datasets) + str(args.m4_groups)
         )
 
     if "timesfm" in args.models:
@@ -120,6 +122,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--m4_data_dir", default="data/m4",
         help="Directory for datasetsforecast to cache M4 data.",
+    )
+    parser.add_argument(
+        "--m4_filter_file", default="outputs/chronos_m4monthly_gt_uids.csv",
+        help="File to uses only the instances that have non-hallucinated targets."
     )
 
     # ── models ────────────────────────────────────────────────────────

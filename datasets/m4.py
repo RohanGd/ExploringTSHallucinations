@@ -29,8 +29,17 @@ from torch.utils.data import Dataset
 
 from .base import TimeSeriesSample
 
-# All six M4 groups
+# All six M4 groups and their official competition forecast horizons
 M4_GROUPS = ["Yearly", "Quarterly", "Monthly", "Weekly", "Daily", "Hourly"]
+
+M4_NATIVE_HORIZONS = {
+    "Yearly":    6,
+    "Quarterly": 8,
+    "Monthly":   18,
+    "Weekly":    13,
+    "Daily":     14,
+    "Hourly":    48,
+}
 
 
 def _find_csv(data_dir: str, group: str, split: str) -> str:
@@ -115,12 +124,16 @@ def _load_group(
     group:            str,
     data_dir:         str,
     context_len:      int,
-    forecast_horizon: int,
+    forecast_horizon: int | None,   # None → use M4_NATIVE_HORIZONS[group]
     min_context_len:  int,
     force_download:   bool = False,
 ) -> list:
     """Locate CSVs on disk, parse them, and return TimeSeriesSamples."""
-    print(f"  Loading M4/{group} …", flush=True)
+    native_horizon   = M4_NATIVE_HORIZONS[group]
+    forecast_horizon = forecast_horizon or native_horizon
+
+    print(f"  Loading M4/{group}  "
+          f"(native_horizon={native_horizon}, using={forecast_horizon}) …", flush=True)
 
     train_path = _find_csv(data_dir, group, "train")
     test_path  = _find_csv(data_dir, group, "test")
@@ -128,7 +141,6 @@ def _load_group(
     train_df = _read_m4_csv(train_path)
     test_df  = _read_m4_csv(test_path)
 
-    # Index by uid for fast lookup
     train_grp = train_df.groupby("unique_id")["y"].apply(np.array)
     test_grp  = test_df.groupby("unique_id")["y"].apply(np.array)
 
@@ -140,15 +152,13 @@ def _load_group(
 
         context = train_vals[-context_len:]
 
-        if uid in test_grp.index:
-            test_vals = test_grp[uid].astype(np.float32)
-        else:
-            test_vals = np.array([], dtype=np.float32)
+        test_vals = test_grp[uid].astype(np.float32) if uid in test_grp.index \
+                    else np.array([], dtype=np.float32)
 
         if len(test_vals) >= forecast_horizon:
             target = test_vals[:forecast_horizon]
         else:
-            # Tail-pad with NaN so shape is always (forecast_horizon,)
+            # Tail-pad with NaN only when forecast_horizon > native_horizon
             target = np.full(forecast_horizon, np.nan, dtype=np.float32)
             target[: len(test_vals)] = test_vals
 
@@ -156,7 +166,11 @@ def _load_group(
             context  = context,
             target   = target,
             item_id  = f"m4_{uid}",
-            metadata = {"group": group, "uid": uid},
+            metadata = {
+                "group":          group,
+                "uid":            uid,
+                "native_horizon": native_horizon,
+            },
         ))
 
     print(f"    {len(samples)} series kept.")
@@ -166,39 +180,92 @@ def _load_group(
 # ─────────────────────────────────────────────────────────────────────────────
 class M4Dataset(Dataset):
     """
-    M4 dataset for all (or a subset of) frequency groups.
+    M4 dataset for one or more frequency groups.
 
     Parameters
     ----------
     groups           : groups to include; None → all six.
-    context_len      : max context length (variable-length OK for short series).
-    forecast_horizon : target horizon length.
+    context_len      : cap on context length (series shorter than this are
+                       used as-is; NaN-padding is done in the collate_fn).
+    forecast_horizon : target horizon per group.
+                       None (default) → each group uses its native M4 horizon.
+                       int            → override for all groups (use with care;
+                                        e.g. 64 causes NaN-padding for all groups
+                                        except Hourly).
     data_dir         : local directory for cached CSVs.
     min_context_len  : series with fewer training points are skipped.
     force_download   : re-download even if CSVs already exist.
+
+    Attributes
+    ----------
+    forecast_horizon : int  — the horizon used (native if not overridden,
+                               or the single override value).
+                               When groups have *different* native horizons and
+                               no override is set, use per-group datasets instead
+                               (see run.py for the recommended pattern).
     """
 
     def __init__(
         self,
         groups:           list | None = None,
         context_len:      int  = 500,
-        forecast_horizon: int  = 64,
+        forecast_horizon: int | None = None,   # None → native per group
         data_dir:         str  = "data/m4",
         min_context_len:  int  = 10,
         force_download:   bool = False,
+        filter:           str | None = None,   # path to knowledge-rule CSV
     ):
-        self.context_len      = context_len
-        self.forecast_horizon = forecast_horizon
-        self.groups           = groups or M4_GROUPS
+        self.context_len = context_len
+        self.groups      = groups or M4_GROUPS
+
+        # Resolve effective horizon
+        if forecast_horizon is not None:
+            self.forecast_horizon = forecast_horizon
+        elif len(self.groups) == 1:
+            self.forecast_horizon = M4_NATIVE_HORIZONS[self.groups[0]]
+        else:
+            horizons = [M4_NATIVE_HORIZONS[g] for g in self.groups]
+            if len(set(horizons)) > 1:
+                print(
+                    f"  Warning: groups {self.groups} have different native horizons "
+                    f"{horizons}. Targets will be NaN-padded to max={max(horizons)}. "
+                    f"Consider running one group at a time for clean targets."
+                )
+            self.forecast_horizon = max(horizons)
+
+        # ── Build allowed-id set from filter file ─────────────────────
+        # CSV columns: item_id, group, uid, trend rule, frequency rule,
+        #              pattern rule, ARMA rule, hallu
+        # Keep only rows where hallu == False (ground truth is clean).
+        allowed_ids: set | None = None
+        if filter is not None:
+            filter_df = pd.read_csv(filter)
+            hallu_col = filter_df["hallu"]
+            if hallu_col.dtype == object:
+                hallu_col = hallu_col.str.strip().str.lower().map(
+                    {"false": False, "true": True, "0": False, "1": True}
+                )
+            not_hallu  = filter_df[~hallu_col.astype(bool)]
+            allowed_ids = set(not_hallu["item_id"].astype(str))
+            print(f"  Filter: {len(allowed_ids)} non-hallucinated series "
+                  f"loaded from {filter}")
 
         print("Loading M4 dataset …")
         self.samples: list[TimeSeriesSample] = []
         for g in self.groups:
             self.samples.extend(
-                _load_group(g, data_dir, context_len, forecast_horizon,
+                _load_group(g, data_dir, context_len, self.forecast_horizon,
                             min_context_len, force_download)
             )
-        print(f"M4 total: {len(self.samples)} series.")
+
+        # Apply filter — item_id format is "m4_{uid}"
+        if allowed_ids is not None:
+            before = len(self.samples)
+            self.samples = [s for s in self.samples if s.item_id in allowed_ids]
+            print(f"  Filter applied: {before} → {len(self.samples)} series kept.")
+
+        print(f"M4 total: {len(self.samples)} series  |  "
+              f"forecast_horizon={self.forecast_horizon}")
 
     def __len__(self) -> int:
         return len(self.samples)
